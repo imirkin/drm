@@ -951,9 +951,10 @@ struct property_arg {
 	char name[DRM_PROP_NAME_LEN+1];
 	uint32_t prop_id;
 	uint64_t value;
+	bool optional;
 };
 
-static void set_property(struct device *dev, struct property_arg *p)
+static bool set_property(struct device *dev, struct property_arg *p)
 {
 	drmModeObjectProperties *props = NULL;
 	drmModePropertyRes **props_info = NULL;
@@ -985,13 +986,13 @@ static void set_property(struct device *dev, struct property_arg *p)
 	if (p->obj_type == 0) {
 		fprintf(stderr, "Object %i not found, can't set property\n",
 			p->obj_id);
-			return;
+		return false;
 	}
 
 	if (!props) {
 		fprintf(stderr, "%s %i has no properties\n",
 			obj_type, p->obj_id);
-		return;
+		return false;
 	}
 
 	for (i = 0; i < (int)props->count_props; ++i) {
@@ -1002,9 +1003,10 @@ static void set_property(struct device *dev, struct property_arg *p)
 	}
 
 	if (i == (int)props->count_props) {
-		fprintf(stderr, "%s %i has no %s property\n",
-			obj_type, p->obj_id, p->name);
-		return;
+		if (!p->optional)
+			fprintf(stderr, "%s %i has no %s property\n",
+				obj_type, p->obj_id, p->name);
+		return false;
 	}
 
 	p->prop_id = props->props[i];
@@ -1018,6 +1020,8 @@ static void set_property(struct device *dev, struct property_arg *p)
 	if (ret < 0)
 		fprintf(stderr, "failed to set %s %i property %s to %" PRIu64 ": %s\n",
 			obj_type, p->obj_id, p->name, p->value, strerror(errno));
+
+	return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1073,6 +1077,19 @@ static void add_property(struct device *dev, uint32_t obj_id,
 	p.value = value;
 
 	set_property(dev, &p);
+}
+
+static bool add_property_optional(struct device *dev, uint32_t obj_id,
+				  const char *name, uint64_t value)
+{
+	struct property_arg p;
+
+	p.obj_id = obj_id;
+	strcpy(p.name, name);
+	p.value = value;
+	p.optional = true;
+
+	return set_property(dev, &p);
 }
 
 static int atomic_set_plane(struct device *dev, struct plane_arg *p,
@@ -1384,6 +1401,7 @@ static void set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int co
 	dev->mode.height = 0;
 	dev->mode.fb_id = 0;
 
+
 	for (i = 0; i < count; i++) {
 		struct pipe_arg *pipe = &pipes[i];
 
@@ -1454,15 +1472,21 @@ static void set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int co
 				return;
 			}
 		} else {
-			/* gamma may be left over from a previous modeset */
-			uint16_t r[256], g[256], b[256];
+			/* gamma may be left over from a previous
+			 * modeset. try clearing the GAMMA_LUT, and if
+			 * the property is not there, then via legacy
+			 * mechanisms.
+			 */
+			if (!add_property_optional(dev, pipe->crtc->crtc->crtc_id, "GAMMA_LUT", 0)) {
+				uint16_t r[256], g[256], b[256];
 
-			for (j = 0; j < 256; j++)
-				r[j] = g[j] = b[j] = j << 8;
-			/* errors are probably ok */
-			drmModeCrtcSetGamma(
-					dev->fd, pipe->crtc->crtc->crtc_id,
-					256, r, g, b);
+				for (j = 0; j < 256; j++)
+					r[j] = g[j] = b[j] = j << 8;
+				/* errors are probably ok */
+				drmModeCrtcSetGamma(
+						dev->fd, pipe->crtc->crtc->crtc_id,
+						256, r, g, b);
+			}
 		}
 	}
 }
