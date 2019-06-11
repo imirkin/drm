@@ -50,6 +50,8 @@
 #include <strings.h>
 #include <errno.h>
 #include <poll.h>
+#include <getopt.h>
+#include <math.h>
 #include <sys/time.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
@@ -125,6 +127,14 @@ struct device {
 
 	int use_atomic;
 	drmModeAtomicReq *req;
+};
+
+enum gamma_type {
+	NONE = 0,
+	LINEAR,
+	INVERTED,
+	SRGB,
+	DE_SRGB,
 };
 
 static inline int64_t U642I64(uint64_t val)
@@ -802,6 +812,9 @@ struct pipe_arg {
 	unsigned int fb_id[2], current_fb_id;
 	struct timeval start;
 
+	enum gamma_type gamma, degamma;
+	double *ctm;
+
 	int swap_count;
 };
 
@@ -1092,28 +1105,82 @@ static bool add_property_optional(struct device *dev, uint32_t obj_id,
 	return set_property(dev, &p);
 }
 
-static void set_gamma(struct device *dev, unsigned crtc_id, unsigned fourcc)
+static void set_gamma_pattern(struct drm_color_lut *lut,
+			      enum gamma_type pattern)
 {
-	unsigned blob_id = 0;
-	/* TODO: support 1024-sized LUTs, when the use-case arises */
-	struct drm_color_lut gamma_lut[256];
-	int i, ret;
+	int i;
 
-	if (fourcc == DRM_FORMAT_C8) {
-		/* TODO: Add C8 support for more patterns */
-		util_smpte_c8_gamma(256, gamma_lut);
-		drmModeCreatePropertyBlob(dev->fd, gamma_lut, sizeof(gamma_lut), &blob_id);
-	} else {
+	if (pattern == NONE || pattern == LINEAR) {
 		for (i = 0; i < 256; i++) {
-			gamma_lut[i].red =
-			gamma_lut[i].green =
-			gamma_lut[i].blue = i << 8;
+			lut[i].red =
+			lut[i].green =
+			lut[i].blue = i << 8;
+		}
+	} else if (pattern == INVERTED) {
+		for (i = 0; i < 256; i++) {
+			lut[i].red =
+			lut[i].green =
+			lut[i].blue = (255 - i) << 8;
+		}
+	} else if (pattern == SRGB) {
+		for (i = 0; i < 256; i++) {
+			lut[i].red =
+			lut[i].green =
+			lut[i].blue = (uint16_t)(pow(i / 255.0, 2.2) * 65535);
+		}
+	} else if (pattern == DE_SRGB) {
+		for (i = 0; i < 256; i++) {
+			lut[i].red =
+			lut[i].green =
+			lut[i].blue = (uint16_t)(pow(i / 255.0, 1.0/2.2) * 65535);
 		}
 	}
+}
 
-	add_property_optional(dev, crtc_id, "DEGAMMA_LUT", 0);
-	add_property_optional(dev, crtc_id, "CTM", 0);
-	if (!add_property_optional(dev, crtc_id, "GAMMA_LUT", blob_id)) {
+static uint64_t double_to_smag31_32(double in) {
+	/* This is not 100% accurate, but ... most GPUs won't be able
+	 * to handle the full range anyways.
+	 */
+	in *= 1ULL << 32;
+	return ((uint64_t)!!(in < 0) << 63) | (uint64_t)fabs(in);
+}
+
+static void set_gamma(struct device *dev, struct pipe_arg *pipe,
+		      unsigned crtc_id, unsigned fourcc)
+{
+	unsigned gamma_id = 0, degamma_id = 0, ctm_id = 0;
+	/* TODO: support 1024-sized LUTs, when the use-case arises */
+	struct drm_color_lut gamma_lut[256];
+	struct drm_color_lut degamma_lut[256];
+	struct drm_color_ctm ctm;
+	int i, ret;
+
+	/* Let's say C8 implies no fancy gamma stuff for
+	 * now. Otherwise it becomes a lot more complex to support
+	 * both pre-blob-property and new setups. */
+	if (fourcc == DRM_FORMAT_C8) {
+		util_smpte_c8_gamma(256, gamma_lut);
+		pipe->gamma = LINEAR;
+		pipe->degamma = NONE;
+		pipe->ctm = NULL;
+	} else {
+		set_gamma_pattern(gamma_lut, pipe->gamma);
+		set_gamma_pattern(degamma_lut, pipe->degamma);
+		if (pipe->ctm)
+			for (i = 0; i < 9; i++)
+				ctm.matrix[i] = double_to_smag31_32(pipe->ctm[i]);
+	}
+
+	if (pipe->gamma != NONE)
+		drmModeCreatePropertyBlob(dev->fd, gamma_lut, sizeof(gamma_lut), &gamma_id);
+	if (pipe->degamma != NONE)
+		drmModeCreatePropertyBlob(dev->fd, degamma_lut, sizeof(degamma_lut), &degamma_id);
+	if (pipe->ctm != NULL)
+		drmModeCreatePropertyBlob(dev->fd, &ctm, sizeof(ctm), &ctm_id);
+
+	add_property_optional(dev, crtc_id, "DEGAMMA_LUT", degamma_id);
+	add_property_optional(dev, crtc_id, "CTM", ctm_id);
+	if (!add_property_optional(dev, crtc_id, "GAMMA_LUT", gamma_id)) {
 		uint16_t r[256], g[256], b[256];
 
 		for (i = 0; i < 256; i++) {
@@ -1309,8 +1376,8 @@ static void atomic_set_planes(struct device *dev, struct plane_arg *p,
 	for (i = 0; i < count; i++) {
 		if (i > 0)
 			pattern = secondary_fill;
-		else
-			set_gamma(dev, p[i].crtc_id, p[i].fourcc);
+		//else
+		//	set_gamma(dev, p[i].crtc_id, p[i].fourcc);
 
 		if (atomic_set_plane(dev, &p[i], pattern, update))
 			return;
@@ -1496,7 +1563,7 @@ static void set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int co
 			return;
 		}
 
-		set_gamma(dev, pipe->crtc->crtc->crtc_id, pipe->fourcc);
+		set_gamma(dev, pipe, pipe->crtc->crtc->crtc_id, pipe->fourcc);
 	}
 }
 
@@ -1890,7 +1957,41 @@ static int pipe_resolve_connectors(struct device *dev, struct pipe_arg *pipe)
 	return 0;
 }
 
+static void parse_gamma(char *arg, enum gamma_type *gamma)
+{
+	if (!strcmp(arg, "linear"))
+		*gamma = LINEAR;
+	else if (!strcmp(arg, "inverted"))
+		*gamma = INVERTED;
+	else if (!strcmp(arg, "srgb"))
+		*gamma = SRGB;
+	else if (!strcmp(arg, "de-srgb"))
+		*gamma = DE_SRGB;
+	else
+		fprintf(stderr, "unknown gamma ramp: %s\n", arg);
+}
+
+static void parse_ctm(char *arg, struct pipe_arg *pipe)
+{
+	int i;
+	char *element;
+
+	pipe->ctm = calloc(9, sizeof(double));
+	for (i = 0, element = strtok(arg, ",");
+	     i < 9 && element;
+	     i++, element = strtok(NULL, ",")) {
+		sscanf(element, "%lf", &pipe->ctm[i]);
+	}
+}
+
 static char optstr[] = "acdD:efF:M:P:ps:Cvw:";
+
+static const struct option long_options[] = {
+	{"degamma", required_argument, 0, 0},
+	{"gamma", required_argument, 0, 0},
+	{"ctm", required_argument, 0, 0},
+	{},
+};
 
 int main(int argc, char **argv)
 {
@@ -1911,15 +2012,37 @@ int main(int argc, char **argv)
 	struct plane_arg *plane_args = NULL;
 	struct property_arg *prop_args = NULL;
 	unsigned int args = 0;
+	int option_index = 0;
 	int ret;
 
 	memset(&dev, 0, sizeof dev);
 
 	opterr = 0;
-	while ((c = getopt(argc, argv, optstr)) != -1) {
+	while ((c = getopt_long(argc, argv, optstr, long_options, &option_index)) != -1) {
 		args++;
 
 		switch (c) {
+		case 0:
+			if (count == 0) {
+				fprintf(stderr, "%s must come after mode\n",
+					long_options[option_index].name);
+				break;
+			}
+			switch (option_index) {
+			case 0: /* degamma */
+				parse_gamma(optarg, &pipe_args[count-1].degamma);
+				break;
+			case 1: /* gamma */
+				parse_gamma(optarg, &pipe_args[count-1].gamma);
+				break;
+			case 2: /* ctm */
+				parse_ctm(optarg, &pipe_args[count-1]);
+				break;
+			default:
+				usage(argv[0]);
+				break;
+			}
+			break;
 		case 'a':
 			use_atomic = 1;
 			break;
