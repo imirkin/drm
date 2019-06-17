@@ -812,7 +812,10 @@ struct pipe_arg {
 	unsigned int fb_id[2], current_fb_id;
 	struct timeval start;
 
-	enum gamma_type gamma, degamma;
+	struct gamma_t {
+		enum gamma_type type;
+		unsigned int size;
+	} gamma, degamma;
 	double *ctm;
 
 	int swap_count;
@@ -1105,34 +1108,39 @@ static bool add_property_optional(struct device *dev, uint32_t obj_id,
 	return set_property(dev, &p);
 }
 
-static void set_gamma_pattern(struct drm_color_lut *lut,
-			      enum gamma_type pattern)
+static void set_gamma_pattern(struct drm_color_lut **lut_ref,
+			      struct gamma_t *gamma)
 {
-	int i;
+	unsigned int i;
+	unsigned int size = gamma->size;
+	unsigned int bits = ffs(size) - 1; /* assumes size is POT */
+	enum gamma_type pattern = gamma->type;
+	struct drm_color_lut *lut = *lut_ref =
+		malloc(size * sizeof(struct drm_color_lut));
 
 	if (pattern == NONE || pattern == LINEAR) {
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < size; i++) {
 			lut[i].red =
 			lut[i].green =
-			lut[i].blue = i << 8;
+			lut[i].blue = i << (16 - bits);
 		}
 	} else if (pattern == INVERTED) {
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < size; i++) {
 			lut[i].red =
 			lut[i].green =
-			lut[i].blue = (255 - i) << 8;
+			lut[i].blue = (size - i - 1) << (16 - bits);
 		}
 	} else if (pattern == SRGB) {
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < size; i++) {
 			lut[i].red =
 			lut[i].green =
-			lut[i].blue = (uint16_t)(pow(i / 255.0, 2.2) * 65535);
+			lut[i].blue = (uint16_t)(pow(i / (size - 1.0), 2.2) * 65535);
 		}
 	} else if (pattern == DE_SRGB) {
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < size; i++) {
 			lut[i].red =
 			lut[i].green =
-			lut[i].blue = (uint16_t)(pow(i / 255.0, 1.0/2.2) * 65535);
+			lut[i].blue = (uint16_t)(pow(i / (size - 1.0), 1.0/2.2) * 65535);
 		}
 	}
 }
@@ -1149,50 +1157,55 @@ static void set_gamma(struct device *dev, struct pipe_arg *pipe,
 		      unsigned crtc_id, unsigned fourcc)
 {
 	unsigned gamma_id = 0, degamma_id = 0, ctm_id = 0;
-	/* TODO: support 1024-sized LUTs, when the use-case arises */
-	struct drm_color_lut gamma_lut[256];
-	struct drm_color_lut degamma_lut[256];
+	unsigned i;
+	struct drm_color_lut *gamma_lut = NULL;
+	struct drm_color_lut *degamma_lut = NULL;
 	struct drm_color_ctm ctm;
-	int i, ret;
+	int ret;
 
 	/* Let's say C8 implies no fancy gamma stuff for
 	 * now. Otherwise it becomes a lot more complex to support
 	 * both pre-blob-property and new setups. */
 	if (fourcc == DRM_FORMAT_C8) {
+		gamma_lut = malloc(256 * sizeof(struct drm_color_lut));
 		util_smpte_c8_gamma(256, gamma_lut);
-		pipe->gamma = LINEAR;
-		pipe->degamma = NONE;
+		pipe->gamma.type = LINEAR;
+		pipe->gamma.size = 256;
+		pipe->degamma.type = NONE;
 		pipe->ctm = NULL;
 	} else {
-		set_gamma_pattern(gamma_lut, pipe->gamma);
-		set_gamma_pattern(degamma_lut, pipe->degamma);
+		set_gamma_pattern(&gamma_lut, &pipe->gamma);
+		set_gamma_pattern(&degamma_lut, &pipe->degamma);
 		if (pipe->ctm)
 			for (i = 0; i < 9; i++)
 				ctm.matrix[i] = double_to_smag31_32(pipe->ctm[i]);
 	}
 
-	if (pipe->gamma != NONE)
-		drmModeCreatePropertyBlob(dev->fd, gamma_lut, sizeof(gamma_lut), &gamma_id);
-	if (pipe->degamma != NONE)
-		drmModeCreatePropertyBlob(dev->fd, degamma_lut, sizeof(degamma_lut), &degamma_id);
+	if (pipe->gamma.type != NONE)
+		drmModeCreatePropertyBlob(dev->fd, gamma_lut, pipe->gamma.size * sizeof(struct drm_color_lut), &gamma_id);
+	if (pipe->degamma.type != NONE)
+		drmModeCreatePropertyBlob(dev->fd, degamma_lut, pipe->gamma.size * sizeof(struct drm_color_lut), &degamma_id);
 	if (pipe->ctm != NULL)
 		drmModeCreatePropertyBlob(dev->fd, &ctm, sizeof(ctm), &ctm_id);
 
 	add_property_optional(dev, crtc_id, "DEGAMMA_LUT", degamma_id);
 	add_property_optional(dev, crtc_id, "CTM", ctm_id);
 	if (!add_property_optional(dev, crtc_id, "GAMMA_LUT", gamma_id)) {
-		uint16_t r[256], g[256], b[256];
+		uint16_t r[pipe->gamma.size], g[pipe->gamma.size], b[pipe->gamma.size];
 
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < pipe->gamma.size; i++) {
 			r[i] = gamma_lut[i].red;
 			g[i] = gamma_lut[i].green;
 			b[i] = gamma_lut[i].blue;
 		}
 
-		ret = drmModeCrtcSetGamma(dev->fd, crtc_id, 256, r, g, b);
+		ret = drmModeCrtcSetGamma(dev->fd, crtc_id, pipe->gamma.size, r, g, b);
 		if (ret)
 			fprintf(stderr, "failed to set gamma: %s\n", strerror(errno));
 	}
+
+	free(gamma_lut);
+	free(degamma_lut);
 }
 
 static int atomic_set_plane(struct device *dev, struct plane_arg *p,
@@ -1957,18 +1970,24 @@ static int pipe_resolve_connectors(struct device *dev, struct pipe_arg *pipe)
 	return 0;
 }
 
-static void parse_gamma(char *arg, enum gamma_type *gamma)
+static void parse_gamma(char *arg, struct gamma_t *gamma)
 {
+	gamma->size = 256;
+	arg = strtok(arg, ":");
 	if (!strcmp(arg, "linear"))
-		*gamma = LINEAR;
+		gamma->type = LINEAR;
 	else if (!strcmp(arg, "inverted"))
-		*gamma = INVERTED;
+		gamma->type = INVERTED;
 	else if (!strcmp(arg, "srgb"))
-		*gamma = SRGB;
+		gamma->type = SRGB;
 	else if (!strcmp(arg, "de-srgb"))
-		*gamma = DE_SRGB;
+		gamma->type = DE_SRGB;
 	else
 		fprintf(stderr, "unknown gamma ramp: %s\n", arg);
+
+	arg = strtok(NULL, ":");
+	if (arg)
+		gamma->size = strtoul(arg, NULL, 10);
 }
 
 static void parse_ctm(char *arg, struct pipe_arg *pipe)
